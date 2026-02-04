@@ -46,6 +46,13 @@ utils_app = typer.Typer(help="Utilities and scripts related commands.", rich_mar
 app.add_typer(utils_app, name="utils")
 
 
+class PlatformType(Enum):
+    """Platform/Device types supported by Netmiko and netobs."""
+
+    ARISTA_EOS = "arista_eos"
+    NOKIA_SRL = "nokia_srl"
+
+
 class NetObsScenarios(Enum):
     """NetObs scenarios."""
 
@@ -65,6 +72,8 @@ class NetObsScenarios(Enum):
     CH12_COMPLETED = "ch12-completed"
     CH13 = "ch13"
     CH13_COMPLETED = "ch13-completed"
+    WEBINAR = "webinar"
+    WEBINAR_COMPLETED = "webinar-completed"
 
 
 class DockerNetworkAction(Enum):
@@ -185,6 +194,19 @@ class NautobotClient:
         if _response.status_code == 204:
             return {}
         return _response.json()
+
+
+def srl_apply(device_conn: netmiko.BaseConnection, commands: list[str]) -> str:
+    """
+    Apply SR Linux commands reliably.
+    Uses timing-based reads to avoid prompt/echo mismatches with netmiko's config_mode().
+    """
+    output = ""
+    for cmd in commands:
+        output += device_conn.send_command_timing(cmd, strip_prompt=False, strip_command=False)
+        # tiny pause helps SRL render/flush output
+        time.sleep(0.1)
+    return output
 
 
 def strtobool(val: str) -> bool:
@@ -994,6 +1016,9 @@ def ansible_command(
     limit: str | None = None,
     extra_vars: str | None = None,
     verbose: int = 0,
+    scenario: str | None = None,
+    topology: Path | None = None,
+    vars_topology: Path | None = None,
 ) -> str:
     """Run an ansible playbook with the given inventories and limit.
 
@@ -1017,6 +1042,15 @@ def ansible_command(
     if extra_vars:
         exec_cmd += f' -e "{extra_vars}"'
 
+    if scenario:
+        exec_cmd += f' -e "lab_scenario={scenario}"'
+
+    if topology:
+        exec_cmd += f' -e "lab_topology_file={topology}"'
+
+    if vars_topology:
+        exec_cmd += f' -e "lab_vars_file={vars_topology}"'
+
     if verbose:
         exec_cmd += f" -{'v' * verbose}"
 
@@ -1029,6 +1063,15 @@ def deploy_droplet(
     extra_vars: Annotated[
         Optional[str], typer.Option("--extra-vars", "-e", help="Extra vars to pass to the playbook")
     ] = None,
+    scenario: Annotated[
+        NetObsScenarios, typer.Option("--scenario", "-s", help="Scenario to execute command", envvar="LAB_SCENARIO")
+    ] = NetObsScenarios.BATTERIES_INCLUDED,
+    topology: Annotated[Path, typer.Option(help="Path to the topology file", exists=True)] = Path(
+        "./containerlab/lab.yml"
+    ),
+    vars_topology: Annotated[Path, typer.Option(help="Path to the vars topology file", exists=True)] = Path(
+        "./containerlab/lab_vars.yml"
+    ),
 ):
     """Create DigitalOcean Droplets.
 
@@ -1058,8 +1101,11 @@ def deploy_droplet(
         inventories=["do_hosts.yaml", "localhost.yaml"],
         verbose=verbose,
         extra_vars=extra_vars,
+        scenario=scenario.value,
+        topology=topology,
+        vars_topology=vars_topology,
     )
-    result = run_cmd(exec_cmd=exec_cmd, envvars=ENVVARS, task_name="create droplets")
+    result = run_cmd(exec_cmd=exec_cmd, envvars=ENVVARS, task_name="setup droplets")
     if result.returncode == 0:
         console.log("Droplets setup successfully", style="good")
     else:
@@ -1152,20 +1198,22 @@ def utils_load_nautobot_data(
     console.log(f"Created Role: [orange1 i]{roles['display']}", style="info")
 
     # Create Manufacturers in Nautobot
-    manufacturers = nautobot_client.http_call(
-        url="/api/dcim/manufacturers/",
-        method="post",
-        json_data={"name": "Arista"},
-    )
-    console.log(f"Created Manufacturer: [orange1 i]{manufacturers['display']}", style="info")
 
-    # Create Device Types in Nautobot
-    device_types = nautobot_client.http_call(
-        url="/api/dcim/device-types/",
-        method="post",
-        json_data={"manufacturer": "Arista", "model": "cEOS"},
-    )
-    console.log(f"Created Device Types: [orange1 i]{device_types['display']}", style="info")
+    for manufacturer in ["Arista", "Nokia"]:
+        manufacturers = nautobot_client.http_call(
+            url="/api/dcim/manufacturers/",
+            method="post",
+            json_data={"name": manufacturer},
+        )
+        console.log(f"Created Manufacturer: [orange1 i]{manufacturers['display']}", style="info")
+
+        # Create Device Types in Nautobot
+        device_types = nautobot_client.http_call(
+            url="/api/dcim/device-types/",
+            method="post",
+            json_data={"manufacturer": manufacturer, "model": "cEOS" if manufacturer == "Arista" else "SRLinux"},
+        )
+        console.log(f"Created Device Types: [orange1 i]{device_types['display']}", style="info")
 
     # Create Location Types
     location_type = nautobot_client.http_call(
@@ -1196,6 +1244,25 @@ def utils_load_nautobot_data(
         },
     )
     console.log(f"Created Status: [orange1 i]{alerted_statuses['display']}", style="info")
+
+    # Create Custom Fields
+    try:
+        nautobot_client.http_call(
+            url="/api/extras/custom-fields/",
+            method="post",
+            json_data={
+                "label": "Maintenance",
+                "key": "maintenance",
+                "type": "boolean",
+                "default": False,
+                "required": False,
+                "content_types": ["dcim.device"],
+            },
+        )
+        console.log("Created custom field: maintenance", style="info")
+    except ValueError:
+        # your client raises ValueError on "already exists"
+        console.log("Custom field already exists: maintenance", style="info")
 
     # Create Locations
     locations = nautobot_client.http_call(
@@ -1248,6 +1315,19 @@ def utils_load_nautobot_data(
 
     # Create Devices
     for node, node_data in topology_dict["topology"]["nodes"].items():
+        intent = extra_topology_vars_dict.get("observability_intent") or {}
+        bgp_intent = intent.get("bgp") or {}
+        device_peers = (bgp_intent.get("intended_peers") or {}).get(node) or []
+
+        local_context = {
+            "observability_intent": {
+                "bgp": {
+                    "afi_safi": bgp_intent.get("afi_safi"),
+                    "intended_peers": device_peers,
+                }
+            }
+}
+
         device = nautobot_client.http_call(
             url="/api/dcim/devices/",
             method="post",
@@ -1259,11 +1339,9 @@ def utils_load_nautobot_data(
                 "location": {"id": locations["id"]},
                 "status": {"id": statuses["id"]},
                 # "primary_ip4": {"id": ip_address["id"]},
-                "customn_fields": {
-                    "containerlab": {
-                        "node_kind": node_data["kind"],
-                        "node_address": node_data["mgmt-ipv4"],
-                    }
+                "local_config_context_data": local_context,
+                "custom_fields": {
+                    "maintenance": False,
                 },
             },
         )
@@ -1271,18 +1349,7 @@ def utils_load_nautobot_data(
 
         # Create IP Addresses and Interfaces
         for intf_data in node_data["interfaces"]:
-            ip_address = nautobot_client.http_call(
-                url="/api/ipam/ip-addresses/",
-                method="post",
-                json_data={
-                    "address": intf_data["ipv4"],
-                    "status": {"id": statuses["id"]},
-                    "namespace": {"id": ipam_namespace["id"]},
-                    "type": "host",
-                },
-            )
-            console.log(f"Created IP Address: [orange1 i]{ip_address['display']}", style="info")
-
+            # 1) Create the interface once
             interface = nautobot_client.http_call(
                 url="/api/dcim/interfaces/",
                 method="post",
@@ -1298,16 +1365,37 @@ def utils_load_nautobot_data(
             )
             console.log(f"Created Interface: [orange1 i]{device['display']}:{interface['display']}", style="info")
 
-            # Create IP address to interface mapping
-            mapping = nautobot_client.http_call(
-                url="/api/ipam/ip-address-to-interface/",
-                method="post",
-                json_data={
-                    "ip_address": {"id": ip_address["id"]},
-                    "interface": {"id": interface["id"]},
-                },
-            )
-            console.log(f"Created IP Address to Interface Mapping: [orange1 i]{mapping['display']}", style="info")
+            # 2) Support ipv4 as string OR list
+            ipv4_list = intf_data.get("ipv4")
+            if not ipv4_list:
+                continue
+            if isinstance(ipv4_list, str):
+                ipv4_list = [ipv4_list]
+
+            # 3) Create + map every IP
+            for addr in ipv4_list:
+                ip_address = nautobot_client.http_call(
+                    url="/api/ipam/ip-addresses/",
+                    method="post",
+                    json_data={
+                        "address": addr,
+                        "status": {"id": statuses["id"]},
+                        "namespace": {"id": ipam_namespace["id"]},
+                        "type": "host",
+                    },
+                )
+                console.log(f"Created IP Address: [orange1 i]{ip_address['display']}", style="info")
+
+                mapping = nautobot_client.http_call(
+                    url="/api/ipam/ip-address-to-interface/",
+                    method="post",
+                    json_data={
+                        "ip_address": {"id": ip_address["id"]},
+                        "interface": {"id": interface["id"]},
+                    },
+                )
+                console.log(f"Created IP->Interface Mapping: [orange1 i]{mapping['display']}", style="info")
+
 
         # Create Mgmt IP Address
         mgmt_ip_address = nautobot_client.http_call(
@@ -1445,26 +1533,81 @@ def utils_device_interface_flap(
     interface: Annotated[str, typer.Option(help="Interface to flap", envvar="LAB_INTERFACE")],
     count: Annotated[int, typer.Option(help="Number of flaps", envvar="LAB_FLAP_COUNT")] = 1,
     delay: Annotated[int, typer.Option(help="Delay between flaps", envvar="LAB_FLAP_DELAY")] = 5,
+    platform: Annotated[
+        PlatformType,
+        typer.Option(
+            help="Netmiko platform (defaults to arista_eos for backwards compatibility)",
+            envvar="LAB_PLATFORM",
+            show_default=True,
+        ),
+    ] = PlatformType.ARISTA_EOS,
 ):
-    """Flap a network device interface."""
-    console.log(f"Flapping interface: [orange1 i]{interface} on device: {device}", style="info")
-    device_conn = netmiko.ConnectHandler(
-        device_type="arista_eos",
-        host=device,
-        username="netobs",
-        password="netobs123",
+    console.log(
+        f"Flapping interface: [orange1 i]{interface} on device: {device} (platform={platform.value})",
+        style="info",
     )
-    # Enable the config mode
-    device_conn.enable()
-    device_conn.config_mode()
-    for _ in range(count):
-        console.log("Bringing interface down...", style="info")
-        device_conn.send_config_set([f"interface {interface}", "shutdown"])
-        time.sleep(delay)
-        console.log("Bringing interface up...", style="info")
-        device_conn.send_config_set([f"interface {interface}", "no shutdown"])
-        time.sleep(delay)
-    console.log(f"Flapped interface: [orange1 i]{interface} on device: {device}", style="info")
+
+    if platform == PlatformType.NOKIA_SRL:
+        username = "admin"
+        password = "NokiaSrl1!"
+    else:
+        username = "netobs"
+        password = "netobs123"
+
+    device_conn = None
+    try:
+        device_conn = netmiko.ConnectHandler(
+            device_type=platform.value,
+            host=device,
+            username=username,
+            password=password,
+            fast_cli=False,      # SRL tends to behave better with this
+        )
+
+        for i in range(count):
+            if platform == PlatformType.ARISTA_EOS:
+                console.log(f"[{i+1}/{count}] Bringing interface down (EOS)...", style="info")
+                device_conn.enable()
+                device_conn.send_config_set([f"interface {interface}", "shutdown"])
+                time.sleep(delay)
+
+                console.log(f"[{i+1}/{count}] Bringing interface up (EOS)...", style="info")
+                device_conn.send_config_set([f"interface {interface}", "no shutdown"])
+                time.sleep(delay)
+
+            else:
+                # SRL: do NOT use send_config_set() (it tries "enter candidate private")
+                console.log(f"[{i+1}/{count}] Bringing interface down (SRL)...", style="info")
+                srl_apply(
+                    device_conn,
+                    [
+                        "enter candidate",
+                        f"set /interface {interface} admin-state disable",
+                        "commit save",
+                    ],
+                )
+                time.sleep(delay)
+
+                console.log(f"[{i+1}/{count}] Bringing interface up (SRL)...", style="info")
+                srl_apply(
+                    device_conn,
+                    [
+                        "enter candidate",
+                        f"set /interface {interface} admin-state enable",
+                        "commit save",
+                    ],
+                )
+                time.sleep(delay)
+
+        console.log(
+            f"Flapped interface: [orange1 i]{interface} on device: {device} (platform={platform.value})",
+            style="info",
+        )
+
+    finally:
+        if device_conn:
+            device_conn.disconnect()
+
 
 
 @utils_app.command("load-prefect-secrets", rich_help_panel="Prefect")
@@ -1472,13 +1615,9 @@ def utils_load_prefect_secrets(
     prefect_api_url: Annotated[
         str, typer.Option(help="Prefect API URL", envvar="PREFECT_API_URL")
     ] = "http://localhost:4200/api",
-    nautobot_token: Annotated[
-        str, typer.Option(help="Nautobot Token", envvar="NAUTOBOT_SUPERUSER_API_TOKEN")
-    ] = "",
+    nautobot_token: Annotated[str, typer.Option(help="Nautobot Token", envvar="NAUTOBOT_SUPERUSER_API_TOKEN")] = "",
     openai_token: Annotated[str, typer.Option(help="OpenAI API Key", envvar="OPENAI_API_KEY")] = "",
-    network_user: Annotated[
-        str, typer.Option(help="Network Agent User", envvar="NETWORK_AGENT_USER")
-    ] = "netobs",
+    network_user: Annotated[str, typer.Option(help="Network Agent User", envvar="NETWORK_AGENT_USER")] = "netobs",
     network_password: Annotated[
         str, typer.Option(help="Network Agent Password", envvar="NETWORK_AGENT_PASSWORD")
     ] = "netobs123",
